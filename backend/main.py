@@ -1,10 +1,13 @@
 """
 WikiPulse FastAPI Backend
 Serves aggregated Wikipedia edit data to the dashboard.
+When LITE_MODE=true, also ingests Wikipedia SSE directly (no Kafka/Spark needed).
 """
 import os
+import json
+import threading
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 
 import psycopg2
 import psycopg2.extras
@@ -12,6 +15,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 DB_URL = os.environ.get("DATABASE_URL", "postgresql://wiki:wiki123@localhost:5432/wikipulse")
+LITE_MODE = os.environ.get("LITE_MODE", "false").lower() == "true"
 _conn = None
 
 
@@ -30,10 +34,94 @@ def query(sql: str, params=None) -> list[dict]:
         return [dict(r) for r in cur.fetchall()]
 
 
+def _lite_ingestor():
+    """Directly reads Wikipedia SSE and writes to Postgres. Runs in a background thread."""
+    import requests, sseclient, time
+    url = "https://stream.wikimedia.org/v2/stream/recentchange"
+    article_counts: dict[str, int] = {}
+    print("[lite] Starting Wikipedia SSE ingestor")
+    while True:
+        try:
+            with requests.get(url, stream=True, timeout=30) as r:
+                client = sseclient.SSEClient(r)
+                for event in client.events():
+                    if not event.data or event.data == "":
+                        continue
+                    try:
+                        d = json.loads(event.data)
+                    except Exception:
+                        continue
+                    if d.get("namespace") != 0 or d.get("type") not in ("edit", "new"):
+                        continue
+                    title = d.get("title", "")
+                    wiki = d.get("wiki", "")
+                    lang = wiki.replace("wiki", "") if wiki.endswith("wiki") else wiki
+                    user = d.get("user", "")
+                    is_bot = d.get("bot", False)
+                    is_new = d.get("type") == "new"
+                    delta = (d.get("length") or {}).get("new", 0) - (d.get("length") or {}).get("old", 0)
+                    comment = (d.get("comment") or "")[:500]
+                    now = datetime.now(timezone.utc)
+                    window = now.replace(second=0, microsecond=0)
+
+                    conn = get_conn()
+                    with conn.cursor() as cur:
+                        # raw edits
+                        cur.execute("""
+                            INSERT INTO edits (event_time, title, wiki, language, user_name,
+                                               is_bot, is_new_page, delta_bytes, comment)
+                            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                        """, (now, title, wiki, lang, user, is_bot, is_new, delta, comment))
+
+                        # 1-min stats upsert
+                        cur.execute("""
+                            INSERT INTO edit_stats_1min
+                                (window_start, total_edits, bot_edits, human_edits, new_pages, unique_editors)
+                            VALUES (%s,1,%s,%s,%s,1)
+                            ON CONFLICT (window_start) DO UPDATE SET
+                                total_edits    = edit_stats_1min.total_edits + 1,
+                                bot_edits      = edit_stats_1min.bot_edits + %s,
+                                human_edits    = edit_stats_1min.human_edits + %s,
+                                new_pages      = edit_stats_1min.new_pages + %s,
+                                unique_editors = edit_stats_1min.unique_editors + 1
+                        """, (window,
+                              1 if is_bot else 0, 0 if is_bot else 1,
+                              1 if is_bot else 0, 0 if is_bot else 1,
+                              1 if is_new else 0))
+
+                        # top articles upsert
+                        key = (title, wiki, window)
+                        article_counts[key] = article_counts.get(key, 0) + 1
+                        cnt = article_counts[key]
+                        is_spike = cnt >= 5
+                        cur.execute("""
+                            INSERT INTO top_articles (window_start, title, wiki, edit_count, is_spike)
+                            VALUES (%s,%s,%s,%s,%s)
+                            ON CONFLICT (window_start, title, wiki) DO UPDATE SET
+                                edit_count = %s, is_spike = %s
+                        """, (window, title, wiki, cnt, is_spike, cnt, is_spike))
+
+                        # spike detection
+                        if is_spike:
+                            cur.execute("""
+                                INSERT INTO spikes (detected_at, title, wiki, edits_in_window, spike_ratio, is_active)
+                                VALUES (%s,%s,%s,%s,1.0,TRUE)
+                                ON CONFLICT DO NOTHING
+                            """, (now, title, wiki, cnt))
+
+        except Exception as e:
+            print(f"[lite] SSE error: {e}, reconnecting in 5s")
+            time.sleep(5)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     get_conn()
     print("[backend] DB connected")
+    if LITE_MODE:
+        t = threading.Thread(target=_lite_ingestor, daemon=True)
+        t.start()
+        print("[backend] Lite ingestor started")
     yield
     if _conn and not _conn.closed:
         _conn.close()
