@@ -1,9 +1,12 @@
 # WikiPulse — Real-Time Wikipedia Edit Analytics
 
+**[🌐 Live Demo](https://frontend-orcin-kappa-11.vercel.app)** | [GitHub](https://github.com/Riiyansh/wiki-pulse)
+
 A production-grade streaming data pipeline that ingests every Wikipedia edit in real time, processes it through Apache Kafka and PySpark Structured Streaming, stores results in PostgreSQL, and serves a live analytics dashboard.
 
 ![Dashboard](https://img.shields.io/badge/stack-Kafka%20%7C%20PySpark%20%7C%20PostgreSQL%20%7C%20FastAPI%20%7C%20Next.js-blue)
 ![Docker](https://img.shields.io/badge/orchestration-Docker%20Compose-2496ED)
+![Live](https://img.shields.io/badge/demo-live-brightgreen)
 
 ## Architecture
 
