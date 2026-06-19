@@ -35,96 +35,114 @@ def query(sql: str, params=None) -> list[dict]:
 
 
 def _lite_ingestor():
-    """Directly reads Wikipedia SSE and writes to Postgres. Runs in a background thread."""
-    import requests, sseclient, time
-    url = "https://stream.wikimedia.org/v2/stream/recentchange"
+    """Polls Wikipedia Recent Changes API every 15s and writes to Postgres."""
+    import requests, time
     article_counts: dict[tuple, int] = {}
-    print("[lite] Starting Wikipedia SSE ingestor")
+    seen_ids: set = set()
+    print("[lite] Starting Wikipedia REST API ingestor")
 
-    # Own connection for this thread
     conn = psycopg2.connect(DB_URL)
     conn.autocommit = True
 
-    count = 0
+    # Poll multiple wikis for variety
+    wikis = ["en", "de", "fr", "ja", "es", "pt", "ru", "zh"]
+    wiki_idx = 0
+    total = 0
+
     while True:
+        lang = wikis[wiki_idx % len(wikis)]
+        wiki_idx += 1
+        api_url = (
+            f"https://{lang}.wikipedia.org/w/api.php"
+            f"?action=query&list=recentchanges&rcnamespace=0"
+            f"&rctype=edit|new&rcprop=title|user|flags|sizes|comment|timestamp"
+            f"&rclimit=50&format=json"
+        )
         try:
-            print("[lite] Connecting to Wikipedia SSE...")
-            with requests.get(url, stream=True, timeout=60) as r:
-                print(f"[lite] SSE connected, status={r.status_code}")
-                client = sseclient.SSEClient(r)
-                for event in client.events():
-                    if not event.data:
-                        continue
+            r = requests.get(api_url, timeout=15,
+                             headers={"User-Agent": "WikiPulse/1.0 (analytics dashboard)"})
+            if r.status_code != 200:
+                print(f"[lite] API {lang} status={r.status_code}")
+                time.sleep(5)
+                continue
+
+            changes = r.json().get("query", {}).get("recentchanges", [])
+            new_count = 0
+            now = datetime.now(timezone.utc)
+            window = now.replace(second=0, microsecond=0)
+
+            for c in changes:
+                uid = (lang, c.get("title"), c.get("timestamp"))
+                if uid in seen_ids:
+                    continue
+                seen_ids.add(uid)
+                if len(seen_ids) > 10000:
+                    seen_ids.clear()
+
+                title = c.get("title", "")
+                user = c.get("user", "")
+                is_bot = "bot" in c.get("flags", "")
+                is_new = c.get("type") == "new"
+                old_sz = c.get("oldlen") or 0
+                new_sz = c.get("newlen") or 0
+                delta = new_sz - old_sz
+                comment = (c.get("comment") or "")[:500]
+                wiki = f"{lang}wiki"
+
+                try:
+                    with conn.cursor() as cur:
+                        cur.execute("""
+                            INSERT INTO edits (event_time, title, wiki, language, user_name,
+                                               is_bot, is_new_page, delta_bytes, comment)
+                            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                        """, (now, title, wiki, lang, user, is_bot, is_new, delta, comment))
+
+                        cur.execute("""
+                            INSERT INTO edit_stats_1min
+                                (window_start, total_edits, bot_edits, human_edits, new_pages, unique_editors)
+                            VALUES (%s,1,%s,%s,%s,1)
+                            ON CONFLICT (window_start) DO UPDATE SET
+                                total_edits    = edit_stats_1min.total_edits + 1,
+                                bot_edits      = edit_stats_1min.bot_edits + EXCLUDED.bot_edits,
+                                human_edits    = edit_stats_1min.human_edits + EXCLUDED.human_edits,
+                                new_pages      = edit_stats_1min.new_pages + EXCLUDED.new_pages,
+                                unique_editors = edit_stats_1min.unique_editors + 1
+                        """, (window, 1 if is_bot else 0, 0 if is_bot else 1, 1 if is_new else 0))
+
+                        key = (title, wiki, window)
+                        article_counts[key] = article_counts.get(key, 0) + 1
+                        cnt = article_counts[key]
+                        is_spike = cnt >= 5
+                        cur.execute("""
+                            INSERT INTO top_articles (window_start, title, wiki, edit_count, is_spike)
+                            VALUES (%s,%s,%s,%s,%s)
+                            ON CONFLICT (window_start, title, wiki) DO UPDATE SET
+                                edit_count = EXCLUDED.edit_count, is_spike = EXCLUDED.is_spike
+                        """, (window, title, wiki, cnt, is_spike))
+
+                        if is_spike:
+                            cur.execute("""
+                                INSERT INTO spikes (detected_at, title, wiki, edits_in_window, spike_ratio, is_active)
+                                VALUES (%s,%s,%s,%s,1.0,TRUE)
+                                ON CONFLICT (detected_at, title, wiki) DO NOTHING
+                            """, (now, title, wiki, cnt))
+                    new_count += 1
+                    total += 1
+                except Exception as db_err:
+                    print(f"[lite] DB error: {db_err}")
                     try:
-                        d = json.loads(event.data)
+                        conn = psycopg2.connect(DB_URL)
+                        conn.autocommit = True
                     except Exception:
-                        continue
-                    count += 1
-                    if count % 100 == 0:
-                        print(f"[lite] Processed {count} events total")
-                    if d.get("namespace") != 0 or d.get("type") not in ("edit", "new"):
-                        continue
-                    title = d.get("title", "")
-                    wiki = d.get("wiki", "")
-                    lang = wiki[:-4] if wiki.endswith("wiki") else wiki
-                    user = d.get("user", "")
-                    is_bot = bool(d.get("bot", False))
-                    is_new = d.get("type") == "new"
-                    length = d.get("length") or {}
-                    delta = (length.get("new") or 0) - (length.get("old") or 0)
-                    comment = (d.get("comment") or "")[:500]
-                    now = datetime.now(timezone.utc)
-                    window = now.replace(second=0, microsecond=0)
+                        pass
 
-                    try:
-                        with conn.cursor() as cur:
-                            cur.execute("""
-                                INSERT INTO edits (event_time, title, wiki, language, user_name,
-                                                   is_bot, is_new_page, delta_bytes, comment)
-                                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)
-                            """, (now, title, wiki, lang, user, is_bot, is_new, delta, comment))
-
-                            cur.execute("""
-                                INSERT INTO edit_stats_1min
-                                    (window_start, total_edits, bot_edits, human_edits, new_pages, unique_editors)
-                                VALUES (%s,1,%s,%s,%s,1)
-                                ON CONFLICT (window_start) DO UPDATE SET
-                                    total_edits    = edit_stats_1min.total_edits + 1,
-                                    bot_edits      = edit_stats_1min.bot_edits + EXCLUDED.bot_edits,
-                                    human_edits    = edit_stats_1min.human_edits + EXCLUDED.human_edits,
-                                    new_pages      = edit_stats_1min.new_pages + EXCLUDED.new_pages,
-                                    unique_editors = edit_stats_1min.unique_editors + 1
-                            """, (window, 1 if is_bot else 0, 0 if is_bot else 1, 1 if is_new else 0))
-
-                            key = (title, wiki, window)
-                            article_counts[key] = article_counts.get(key, 0) + 1
-                            cnt = article_counts[key]
-                            is_spike = cnt >= 5
-                            cur.execute("""
-                                INSERT INTO top_articles (window_start, title, wiki, edit_count, is_spike)
-                                VALUES (%s,%s,%s,%s,%s)
-                                ON CONFLICT (window_start, title, wiki) DO UPDATE SET
-                                    edit_count = EXCLUDED.edit_count,
-                                    is_spike   = EXCLUDED.is_spike
-                            """, (window, title, wiki, cnt, is_spike))
-
-                            if is_spike:
-                                cur.execute("""
-                                    INSERT INTO spikes (detected_at, title, wiki, edits_in_window, spike_ratio, is_active)
-                                    VALUES (%s,%s,%s,%s,1.0,TRUE)
-                                    ON CONFLICT (detected_at, title, wiki) DO NOTHING
-                                """, (now, title, wiki, cnt))
-                    except Exception as db_err:
-                        print(f"[lite] DB error: {db_err}")
-                        try:
-                            conn = psycopg2.connect(DB_URL)
-                            conn.autocommit = True
-                        except Exception:
-                            pass
+            if new_count:
+                print(f"[lite] Inserted {new_count} edits from {lang}wiki (total={total})")
 
         except Exception as e:
-            print(f"[lite] SSE error: {e}, reconnecting in 5s")
-            time.sleep(5)
+            print(f"[lite] Error fetching {lang}: {e}")
+
+        time.sleep(3)
 
 
 def init_db():
