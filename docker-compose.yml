@@ -1,0 +1,101 @@
+version: "3.9"
+
+services:
+
+  # ── Zookeeper (required by Kafka) ──────────────────────────────────
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.5.0
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+    healthcheck:
+      test: ["CMD", "nc", "-z", "localhost", "2181"]
+      interval: 10s
+      retries: 5
+
+  # ── Kafka broker ───────────────────────────────────────────────────
+  kafka:
+    image: confluentinc/cp-kafka:7.5.0
+    depends_on:
+      zookeeper:
+        condition: service_healthy
+    ports:
+      - "9092:9092"
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:29092,PLAINTEXT_HOST://localhost:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+    healthcheck:
+      test: ["CMD", "kafka-topics", "--bootstrap-server", "localhost:9092", "--list"]
+      interval: 15s
+      retries: 10
+
+  # ── PostgreSQL ─────────────────────────────────────────────────────
+  postgres:
+    image: postgres:15-alpine
+    environment:
+      POSTGRES_DB: wikipulse
+      POSTGRES_USER: wiki
+      POSTGRES_PASSWORD: wiki123
+    ports:
+      - "5433:5432"
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+      - ./init.sql:/docker-entrypoint-initdb.d/init.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U wiki -d wikipulse"]
+      interval: 10s
+      retries: 5
+
+  # ── Wikipedia → Kafka Producer ─────────────────────────────────────
+  producer:
+    build: ./producer
+    depends_on:
+      kafka:
+        condition: service_healthy
+    environment:
+      KAFKA_BOOTSTRAP: kafka:29092
+    restart: unless-stopped
+
+  # ── Spark Structured Streaming Consumer ────────────────────────────
+  spark:
+    build: ./spark
+    depends_on:
+      kafka:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    environment:
+      KAFKA_BOOTSTRAP: kafka:29092
+      POSTGRES_URL: jdbc:postgresql://postgres:5432/wikipulse
+      POSTGRES_USER: wiki
+      POSTGRES_PASSWORD: wiki123
+    restart: unless-stopped
+
+  # ── FastAPI Backend ─────────────────────────────────────────────────
+  backend:
+    build: ./backend
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "8000:8000"
+    environment:
+      DATABASE_URL: postgresql://wiki:wiki123@postgres:5432/wikipulse
+    restart: unless-stopped
+
+  # ── Next.js Frontend ────────────────────────────────────────────────
+  frontend:
+    build: ./frontend
+    depends_on:
+      - backend
+    ports:
+      - "3010:3000"
+    environment:
+      NEXT_PUBLIC_API_URL: http://localhost:8000
+    restart: unless-stopped
+
+volumes:
+  pg_data:
