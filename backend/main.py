@@ -114,9 +114,61 @@ def _lite_ingestor():
             time.sleep(5)
 
 
+def init_db():
+    conn = get_conn()
+    with conn.cursor() as cur:
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS edits (
+                id          BIGSERIAL PRIMARY KEY,
+                event_time  TIMESTAMPTZ NOT NULL,
+                title       TEXT NOT NULL,
+                wiki        TEXT NOT NULL,
+                language    TEXT NOT NULL,
+                user_name   TEXT,
+                is_bot      BOOLEAN NOT NULL DEFAULT FALSE,
+                is_new_page BOOLEAN NOT NULL DEFAULT FALSE,
+                delta_bytes INTEGER,
+                comment     TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_edits_time ON edits (event_time DESC);
+
+            CREATE TABLE IF NOT EXISTS edit_stats_1min (
+                window_start  TIMESTAMPTZ PRIMARY KEY,
+                total_edits   INTEGER NOT NULL DEFAULT 0,
+                bot_edits     INTEGER NOT NULL DEFAULT 0,
+                human_edits   INTEGER NOT NULL DEFAULT 0,
+                new_pages     INTEGER NOT NULL DEFAULT 0,
+                unique_editors INTEGER NOT NULL DEFAULT 0
+            );
+
+            CREATE TABLE IF NOT EXISTS top_articles (
+                window_start TIMESTAMPTZ NOT NULL,
+                title        TEXT NOT NULL,
+                wiki         TEXT NOT NULL,
+                edit_count   INTEGER NOT NULL DEFAULT 0,
+                is_spike     BOOLEAN NOT NULL DEFAULT FALSE,
+                PRIMARY KEY (window_start, title, wiki)
+            );
+            CREATE INDEX IF NOT EXISTS idx_top_articles_window ON top_articles (window_start DESC);
+
+            CREATE TABLE IF NOT EXISTS spikes (
+                id              BIGSERIAL PRIMARY KEY,
+                detected_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                title           TEXT NOT NULL,
+                wiki            TEXT NOT NULL,
+                edits_in_window INTEGER NOT NULL,
+                spike_ratio     FLOAT,
+                is_active       BOOLEAN NOT NULL DEFAULT TRUE,
+                UNIQUE (detected_at, title, wiki)
+            );
+        """)
+    print("[backend] Schema ready")
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     get_conn()
+    init_db()
     print("[backend] DB connected")
     if LITE_MODE:
         t = threading.Thread(target=_lite_ingestor, daemon=True)
