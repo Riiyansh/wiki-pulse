@@ -19,11 +19,7 @@ services:
     dockerContext: ./frontend
     envVars:
       - key: NEXT_PUBLIC_API_URL
-        fromService:
-          type: web
-          name: wikipulse-backend
-          property: host
-          envVarKey: BACKEND_URL
+        sync: false
 
 databases:
   - name: wikipulse-db
