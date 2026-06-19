@@ -45,9 +45,12 @@ def _lite_ingestor():
     conn = psycopg2.connect(DB_URL)
     conn.autocommit = True
 
+    count = 0
     while True:
         try:
+            print("[lite] Connecting to Wikipedia SSE...")
             with requests.get(url, stream=True, timeout=60) as r:
+                print(f"[lite] SSE connected, status={r.status_code}")
                 client = sseclient.SSEClient(r)
                 for event in client.events():
                     if not event.data:
@@ -56,6 +59,9 @@ def _lite_ingestor():
                         d = json.loads(event.data)
                     except Exception:
                         continue
+                    count += 1
+                    if count % 100 == 0:
+                        print(f"[lite] Processed {count} events total")
                     if d.get("namespace") != 0 or d.get("type") not in ("edit", "new"):
                         continue
                     title = d.get("title", "")
